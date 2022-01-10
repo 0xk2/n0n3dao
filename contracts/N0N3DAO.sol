@@ -23,17 +23,19 @@ contract N0N3DAO {
     uint256 startLockAt;
     uint256 noOfBlockWithinActivePeriod;
     uint256 lockUntil;
-    bool executed;
     ProposalState state;
-    mapping (address => uint8) supporters;
+    uint256 noOfSupporter;
     address owner;
     uint nextProposalId;
+    bool discarded; // skip
   }
   uint256 totalProposal;
+  // proposalSupporters[proposalId][supporter] = power
+  mapping(uint256 => mapping(address => uint256)) proposalSupporters;
   event VoteCasted (address indexed, bool option, uint256);
   mapping (uint => ProposalInfo) proposals;
   enum ProposalState {
-    WAITING, VOTING, FAILED, PASSED, EXECUTED, FAILEDTOEXECUTE
+    WAITING, VOTING, FAILED, PASSED, STARTEXECUTE, EXECUTED, FAILEDTOEXECUTE
   }
   address public votingTokenAddress;
   uint256 public currentProposalId;
@@ -43,6 +45,15 @@ contract N0N3DAO {
   uint256 public minProposalFee;
   // maxNoOfBlockActivePeriod: maximum number of block within an active period
   uint256 public maxNoOfBlockWithinActivePeriod;
+
+  event QUEUED(address indexed proposalAddress, address indexed owner, uint256 proposalId);
+
+  /**
+  * a successful voted proposal will be waited to execute within this timeframe
+  * 
+  * after this
+   */
+  uint public waitingForRatify;
 
   constructor(address votingTokenAddress_){
     votingTokenAddress = votingTokenAddress_;
@@ -56,7 +67,7 @@ contract N0N3DAO {
     }
   }
 
-  function queue(address proposalAddress, uint proposalFee) external returns(uint proposalId){
+  function queue(address proposalAddress, uint proposalFee) external returns(uint){
     require(proposalFee > minProposalFee, "N0N3DAO: not enough fee");
     if(proposalFee > maxNoOfBlockWithinActivePeriod.mul(feePerBlockWithinActivePeriod)){
       IERC20(votingTokenAddress).transfer(address(this), proposalFee.sub(maxNoOfBlockWithinActivePeriod.mul(feePerBlockWithinActivePeriod)));
@@ -71,30 +82,36 @@ contract N0N3DAO {
       startLockAt: 0,
       noOfBlockWithinActivePeriod: noOfBlockWithinActivePeriod,
       lockUntil: 0,
-      executed: false,
       state: ProposalState.WAITING,
       owner: msg.sender,
-      nextProposalId: 0
+      nextProposalId: 0,
+      noOfSupporter: 0,
+      discarded: false
     });
     newestProposalId = proposalId;
+    emit QUEUED(proposalAddress, msg.sender, proposalId);
     return newestProposalId;
   }
 
-  /**
-  * a successful voted proposal will be waited to execute within this timeframe
-  * 
-  * after this
-   */
-  uint public waitingForRatify;
+  function discard(uint256 proposalId) external{
+    address proposalOwner = proposals[proposalId].owner;
+    require(proposalOwner == msg.sender, "N0N3DAO: cannot discard, you are not the owner");
+    proposals[proposalId].discarded = true;
+  }
+
+  modifier onlyDAO() {
+    require(msg.sender == address(this), "N0N3DAO: onlyDAO can execute this function");
+    _;
+  }
 
   /*
-  * can only go through by a proposal
+  * can only go through by a proposal, how to do it???
   */
-  function setVotingToken(address votingTokenAddress_) internal{
+  function setVotingToken(address votingTokenAddress_) external onlyDAO {
     votingTokenAddress = votingTokenAddress_;
   }
 
-  function setFeePerBlock(uint feePerBlock_) internal {
+  function setFeePerBlock(uint feePerBlock_) external onlyDAO {
     feePerBlockWithinActivePeriod = feePerBlock_;
   }
 
@@ -102,16 +119,16 @@ contract N0N3DAO {
     _beforeVote();
     uint256 votingPower = IERC20(votingTokenAddress).balanceOf(msg.sender);
     require(votingPower > 0, "N0N3DAO: You must have some token to vote");
-    proposals[currentProposalId].supporters[msg.sender] = 1;
+    proposalSupporters[currentProposalId][msg.sender] = votingPower;
     proposals[currentProposalId].power += votingPower;
     _afterVote(msg.sender, true, votingPower);
   }
   
   function no() external {
     _beforeVote();
-    require(proposals[currentProposalId].supporters[msg.sender] == 1, "N0N3DAO: You didn't cast a vote");
+    require(proposalSupporters[currentProposalId][msg.sender] > 0, "N0N3DAO: You didn't cast a vote");
     uint256 votingPower = IERC20(votingTokenAddress).balanceOf(msg.sender);
-    proposals[currentProposalId].supporters[msg.sender] = 0;
+    delete proposalSupporters[currentProposalId][msg.sender];
     proposals[currentProposalId].power -= votingPower;
     _afterVote(msg.sender, false, votingPower);
   }

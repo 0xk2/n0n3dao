@@ -2,6 +2,12 @@
 
 This project propose a simple process for execute onchain proposal
 
+## State machine of a Proposal
+![State Machine](./docs/ProposalStateMachine.png)
+
+## Flow of users: proposal owners and voters
+![Flow of proposal owners and voters](./docs/UserFlow.png)
+
 ## The process for voting is done as following:
  (1) `Owner` `queue(address proposalAddress, uint256 fee) a proposal`. `Owner` can `discard()` while queuing
  
