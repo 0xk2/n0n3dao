@@ -2,6 +2,7 @@
 pragma solidity ^0.8.0;
 
 import "./interfaces/iN0N3DAO.sol";
+import "./types/Proposal.sol";
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/interfaces/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -18,16 +19,23 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 contract N0N3DAO {
   using SafeMath for uint256;
   struct ProposalInfo {
-    address proposalAddress;
+    address addr;
+    address owner;
+
+    address currency;
+    uint256 paid;
     uint256 power;
+    
     uint256 startLockAt;
     uint256 noOfBlockWithinActivePeriod;
-    uint256 lockUntil;
     ProposalState state;
     uint256 noOfSupporter;
-    address owner;
-    uint nextProposalId;
-    bool discarded; // skip
+    
+    
+    uint256 waitingForRatifyNoOfBlock;
+
+    uint256 next;
+    uint256 prev;
   }
   uint256 totalProposal;
   // proposalSupporters[proposalId][supporter] = power
@@ -35,7 +43,7 @@ contract N0N3DAO {
   event VoteCasted (address indexed, bool option, uint256);
   mapping (uint => ProposalInfo) proposals;
   enum ProposalState {
-    WAITING, VOTING, FAILED, PASSED, STARTEXECUTE, EXECUTED, FAILEDTOEXECUTE
+    WAITING, DISCARDED, VOTING, FAILED, PASSED, STARTEXECUTE, EXECUTED, FAILEDTOEXECUTE
   }
   address public votingTokenAddress;
   uint256 public currentProposalId;
@@ -46,14 +54,45 @@ contract N0N3DAO {
   // maxNoOfBlockActivePeriod: maximum number of block within an active period
   uint256 public maxNoOfBlockWithinActivePeriod;
 
+  bool _raceLock;
+
+  function lockRace() private{
+    _raceLock = true;
+  }
+
+  function unlockRace() private {
+    _raceLock = false;
+  }
+
   event QUEUED(address indexed proposalAddress, address indexed owner, uint256 proposalId);
+  event DISCARDED(address indexed proposalAddress, address indexed owner, uint256 proposalId);
+  event VOTINGTOKENCHANGE(address indexed oldTokenAddress, address indexed newTokenAddress);
+  event FEEPERBLOCKCHANGED(uint256 effectiveAfter, uint256 newFee, uint256 oldFee);
+  event ACTIVEPERIODSTARTED(uint256 indexed proposalId, address indexed proposalAddress, address indexed proposalOwner, 
+    uint256 startAt, uint256 endAt);
 
   /**
   * a successful voted proposal will be waited to execute within this timeframe
   * 
   * after this
    */
-  uint public waitingForRatify;
+  uint public waitingForRatifyNoOfBlock;
+
+  modifier onlyDAO() {
+    require(msg.sender == address(this), "N0N3DAO: onlyDAO can execute this function");
+    _;
+  }
+
+  modifier proposalExisted(uint256 proposalId_) {
+    require(proposals[proposalId_].addr != address(0), 
+      "N0N3DAO: proposal is not existed");
+    _;
+  }
+
+  modifier noRaceLocked {
+    require(_raceLock == false, "N0N3DAO: lock to prevent race condition");
+    _;
+  }
 
   constructor(address votingTokenAddress_){
     votingTokenAddress = votingTokenAddress_;
@@ -65,54 +104,104 @@ contract N0N3DAO {
     }else{
       feePerBlockWithinActivePeriod = decimal/1e4;
     }
+    // 7 day, 15s per block
+    waitingForRatifyNoOfBlock = 40320;
   }
 
-  function queue(address proposalAddress, uint proposalFee) external returns(uint){
-    require(proposalFee > minProposalFee, "N0N3DAO: not enough fee");
-    if(proposalFee > maxNoOfBlockWithinActivePeriod.mul(feePerBlockWithinActivePeriod)){
-      IERC20(votingTokenAddress).transfer(address(this), proposalFee.sub(maxNoOfBlockWithinActivePeriod.mul(feePerBlockWithinActivePeriod)));
-    }else{
-      IERC20(votingTokenAddress).transfer(address(this), proposalFee);
-    }
-    uint256 noOfBlockWithinActivePeriod = proposalFee.div(feePerBlockWithinActivePeriod);
-    uint256 proposalId = totalProposal + 1;
-    proposals[proposalId] = ProposalInfo({
-      proposalAddress: proposalAddress,
-      power: 0,
-      startLockAt: 0,
-      noOfBlockWithinActivePeriod: noOfBlockWithinActivePeriod,
-      lockUntil: 0,
-      state: ProposalState.WAITING,
-      owner: msg.sender,
-      nextProposalId: 0,
-      noOfSupporter: 0,
-      discarded: false
-    });
-    newestProposalId = proposalId;
-    emit QUEUED(proposalAddress, msg.sender, proposalId);
-    return newestProposalId;
-  }
-
-  function discard(uint256 proposalId) external{
-    address proposalOwner = proposals[proposalId].owner;
-    require(proposalOwner == msg.sender, "N0N3DAO: cannot discard, you are not the owner");
-    proposals[proposalId].discarded = true;
-  }
-
-  modifier onlyDAO() {
-    require(msg.sender == address(this), "N0N3DAO: onlyDAO can execute this function");
-    _;
-  }
-
-  /*
-  * can only go through by a proposal, how to do it???
-  */
+  /**
+  * Proposal and voting parameters
+   */
   function setVotingToken(address votingTokenAddress_) external onlyDAO {
+    require(votingTokenAddress != votingTokenAddress_, 
+      "N0N3DAO: new token address is the same with old token address");
+    address oldVotingToken = votingTokenAddress;
     votingTokenAddress = votingTokenAddress_;
+    emit VOTINGTOKENCHANGE(oldVotingToken, votingTokenAddress);
+  }
+
+  function proposalLockUntil(uint256 proposalId) public view proposalExisted(proposalId) returns (uint256){
+    return proposals[proposalId].startLockAt + proposals[proposalId].noOfBlockWithinActivePeriod;
   }
 
   function setFeePerBlock(uint feePerBlock_) external onlyDAO {
+    require(feePerBlock_ > 0, "N0N3DAO: should greater than 0");
+    uint256 oldFee = feePerBlockWithinActivePeriod;
     feePerBlockWithinActivePeriod = feePerBlock_;
+    emit FEEPERBLOCKCHANGED(block.number, oldFee, feePerBlockWithinActivePeriod);
+  }
+
+  /**
+  * Proposal owner queue(proposalAddress, proposalFee) returns proposalId
+  * {ONLY} Proposal owner discard(proposalId) return success/failed
+  * {SHOULD} Proposal owner pushIntoVoting(proposalId) returns success/failed
+  * {SHOULD} Proposal owner ratify(proposalId) returns ProposalState
+   */
+
+  function queue(address proposalAddress_, uint proposalFee_) noRaceLocked external returns(uint){
+    require(proposalFee_ > minProposalFee, "N0N3DAO: not enough fee");
+    uint256 feeTaken = 0;
+    if(proposalFee_ > maxNoOfBlockWithinActivePeriod.mul(feePerBlockWithinActivePeriod)){
+      feeTaken = proposalFee_.sub(maxNoOfBlockWithinActivePeriod.mul(feePerBlockWithinActivePeriod));
+    }else{
+      feeTaken = proposalFee_;
+    }
+    IERC20(votingTokenAddress).transfer(address(this), feeTaken);
+    uint256 noOfBlockWithinActivePeriod = feeTaken.div(feePerBlockWithinActivePeriod);
+    uint256 proposalId = totalProposal + 1;
+    proposals[proposalId] = ProposalInfo({
+      addr: proposalAddress_,
+      power: 0,
+      startLockAt: 0,
+      noOfBlockWithinActivePeriod: noOfBlockWithinActivePeriod,
+      waitingForRatifyNoOfBlock: waitingForRatifyNoOfBlock,
+      state: ProposalState.WAITING,
+      owner: msg.sender,
+      noOfSupporter: 0,
+      paid: feeTaken,
+      currency: votingTokenAddress,
+
+      prev: 0,
+      next: 0
+    });
+    newestProposalId = proposalId;
+    emit QUEUED(proposalAddress_, msg.sender, proposalId);
+    return newestProposalId;
+  }
+
+  /*
+  ** Get a 80% refund for discard
+  ** TODO: should be a parameter
+  ** TODO: should remove from mapping // maybe array with push&pop is a better choice
+   */
+  function discard(uint256 proposalId_) proposalExisted(proposalId_) noRaceLocked external returns (bool){
+    require(proposals[proposalId_].owner == msg.sender 
+      && proposals[proposalId_].state == ProposalState.WAITING, 
+      "N0N3DAO: cannot discard, you are not the owner");
+    require(proposals[proposalId_].state == ProposalState.DISCARDED, "N0N3DAO: already discarded");
+    lockRace();
+    proposals[proposalId_].state = ProposalState.DISCARDED;
+    unlockRace();
+    emit DISCARDED(proposals[proposalId_].addr, msg.sender, proposalId_);
+    address votingTokenAddressAtQueue = proposals[proposalId_].currency;
+    uint256 refund = proposals[proposalId_].paid.mul(4).div(5);
+    proposals[proposalId_].paid -= refund;
+    IERC20(votingTokenAddressAtQueue).transferFrom(address(this), msg.sender, refund);
+    return true;
+  }
+
+  /**
+  * pushIntoVoting if the proposals[currentProposalId] is expired
+  */
+  function pushIntoVoting(uint256 proposalId_) external proposalExisted(proposalId_){
+    // is valid proposal? WAITING
+    ProposalInfo storage nextProposal = proposals[proposalId_];
+    ProposalInfo storage lastProposal = proposals[currentProposalId];
+    require(nextProposal.state == ProposalState.WAITING, "N0N3DAO: invalid state");
+    require(proposalLockUntil(currentProposalId) < block.number, "N0N3DAO: current proposal still in effect");
+    // is the latest proposal executed?
+    if(lastProposal.state == ProposalState.PASSED)
+    {}
+    
   }
 
   function yes() external {
@@ -135,7 +224,8 @@ contract N0N3DAO {
 
   function _beforeVote() view private {
     require(currentProposalId > 0, "N0N3DAO: There is no proposal to vote");
-    require(proposals[currentProposalId].lockUntil > block.number, "N0N3DAO: current proposal is expired");
+    require(proposals[currentProposalId].addr != address(0), "N0N3DAO: current proposal is not set");
+    require(proposalLockUntil(currentProposalId) > block.number, "N0N3DAO: current proposal is expired");
   }
 
   function _afterVote(address voter, bool option, uint256 votingPower) private {
@@ -157,8 +247,8 @@ contract N0N3DAO {
   * everyone can enforce
    */
   function ratify() external {
-    
     // enforce the current proposal
+    Proposal(proposals[currentProposalId].addr).execute();
   }
 
   function calculateProposalFee(uint howManyDays) external view returns (uint) {
